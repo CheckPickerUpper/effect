@@ -396,6 +396,28 @@ function printImports(imports: ReadonlyArray<UsedImport | string>): ReadonlyArra
 }
 
 /**
+ * Target schema expressions for named string formats. Each target decodes text from a wire schema.
+ *
+ * @stability experimental
+ * @category models
+ * @since 4.1.5
+ */
+export type StringFormatCodecs = (schema: Binding) => ReadonlyMap<string, Fragment>
+
+/**
+ * Options for registering schema declarations in a generated module.
+ *
+ * @stability experimental
+ * @category models
+ * @since 4.1.5
+ */
+export interface SchemaDeclarationOptions {
+  readonly references?: SchemaRepresentation.References | undefined
+  readonly typeOnly?: boolean | undefined
+  readonly stringFormatCodecs?: StringFormatCodecs | undefined
+}
+
+/**
  * A mutable builder for a TypeScript module, with shared names, imports, and declaration ordering.
  *
  * **Details**
@@ -506,6 +528,9 @@ export class Module {
    *
    * Registers exported type aliases and runtime schemas, their referenced definitions, and auxiliary declarations.
    * Supply the shared reference table through `references`. Set `typeOnly` to emit types and ambient auxiliaries.
+   * Supply `stringFormatCodecs` to decode values with matching string format annotations after their wire checks.
+   * The decoded type is inferred from the target schema. Property names and check arguments use wire schemas.
+   * Decoded schemas cannot combine named properties with index signatures, which would check those same properties.
    * Returned keys preserve the requested names even when declaration names must change to avoid collisions.
    * A root that references a definition of the same name reuses that definition's binding.
    * The module remains open for further declarations; imports and initialization order are resolved when printing.
@@ -539,10 +564,10 @@ export class Module {
    *
    * @see {@link Module.define} for adding surrounding declarations
    */
-  addSchemas(schemas: Readonly<Record<string, SchemaRepresentation.Representation>>, options?: {
-    readonly references?: SchemaRepresentation.References | undefined
-    readonly typeOnly?: boolean | undefined
-  }): ReadonlyMap<string, DeclarationBinding> {
+  addSchemas(
+    schemas: Readonly<Record<string, SchemaRepresentation.Representation>>,
+    options?: SchemaDeclarationOptions
+  ): ReadonlyMap<string, DeclarationBinding> {
     return SchemaCodegen.addSchemas(this, schemas, options)
   }
 

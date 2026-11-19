@@ -29,6 +29,7 @@ import SwaggerToOpenApi from "swagger2openapi"
 import * as HttpApiTransformer from "./HttpApiTransformer.ts"
 import * as HttpClientGenerator from "./internal/httpClient.ts"
 import * as InternalJsonPointer from "./internal/jsonPointer.ts"
+import { stringFormatCodecs } from "./internal/stringFormatCodecs.ts"
 import * as JsonSchemaGenerator from "./JsonSchemaGenerator.ts"
 import * as ParsedOperation from "./ParsedOperation.ts"
 import * as Utils from "./Utils.ts"
@@ -152,6 +153,12 @@ export interface OpenApiGenerateOptions {
    */
   readonly format: OpenApiGeneratorFormat
   /**
+   * Decode string schemas with `date-time`, `int64`, or `uint64` formats as UTC dates or bigints.
+   * Use closed objects for named properties and records for open keys. Type-only output uses wire types.
+   * @default "encoded"
+   */
+  readonly stringFormats?: "encoded" | "decoded" | undefined
+  /**
    * Hook to transform each JSON Schema node before processing.
    */
   readonly onEnter?: ((js: JsonSchema.JsonSchema) => JsonSchema.JsonSchema) | undefined
@@ -229,6 +236,7 @@ export const make = Effect.gen(function*() {
       const schemaOptions = {
         onEnter: options.onEnter,
         closeObjects: options.closeObjects,
+        stringFormatCodecs: selectStringFormatCodecs(options),
         multipartSchemaRefs: multipart.refs,
         binarySchemas: new Set(parsed.operations.flatMap((operation) =>
           [
@@ -281,6 +289,13 @@ export const make = Effect.gen(function*() {
 
   return { generate } as const
 })
+
+function selectStringFormatCodecs(options: OpenApiGenerateOptions): Codegen.StringFormatCodecs {
+  if (options.stringFormats === "decoded") return stringFormatCodecs
+  return noStringFormatCodecs
+}
+
+const noStringFormatCodecs: Codegen.StringFormatCodecs = () => new Map<string, Codegen.Fragment>()
 
 type WarningEmitter = (warning: OpenApiGeneratorWarning) => void
 

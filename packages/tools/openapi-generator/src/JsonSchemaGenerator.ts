@@ -28,6 +28,7 @@ import * as SchemaRepresentation from "effect/SchemaRepresentation"
 type Source = "openapi-3.0" | "openapi-3.1"
 interface GenerateOptions {
   readonly onEnter?: ((js: JsonSchema.JsonSchema) => JsonSchema.JsonSchema) | undefined
+  readonly stringFormatCodecs?: Codegen.StringFormatCodecs | undefined
   readonly multipartSchemaRefs?: MultipartSchemaRefs | undefined
   readonly binarySchemas?: ReadonlySet<string> | undefined
   readonly includeSchemas?: ReadonlyArray<string> | undefined
@@ -119,7 +120,8 @@ export function compile(
   if (prepared === undefined) return new Map()
   return module.addSchemas(prepared.schemas, {
     references: prepared.references,
-    typeOnly
+    typeOnly,
+    stringFormatCodecs: options?.stringFormatCodecs
   })
 }
 

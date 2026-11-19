@@ -1,5 +1,5 @@
 import * as Arr from "../../Array.ts"
-import type { Binding, DeclarationBinding, Fragment, Import, Module } from "../../Codegen.ts"
+import type { Binding, DeclarationBinding, Fragment, Import, Module, SchemaDeclarationOptions } from "../../Codegen.ts"
 import { format, formatPropertyKey } from "../../Formatter.ts"
 import type * as Schema from "../../Schema.ts"
 import type * as SchemaRepresentation from "../../SchemaRepresentation.ts"
@@ -10,6 +10,7 @@ import * as CodeExpression from "./codeExpression.ts"
 import * as CodeImports from "./codeImports.ts"
 
 type Path = ReadonlyArray<string | number>
+type SchemaSide = "decoded" | "encoded"
 type CheckRepresentationAnnotation = SchemaRepresentation.CheckRepresentationAnnotation<
   SchemaRepresentation.Representation
 >
@@ -126,13 +127,15 @@ const moduleSymbols = new WeakMap<Module, Map<symbol, SymbolDeclaration>>()
 export function addSchemas(
   module: Module,
   schemas: Readonly<Record<string, SchemaRepresentation.Representation>>,
-  options?: {
-    readonly references?: SchemaRepresentation.References | undefined
-    readonly typeOnly?: boolean | undefined
-  }
+  options?: SchemaDeclarationOptions
 ): ReadonlyMap<string, DeclarationBinding> {
   const typeOnly = options?.typeOnly === true
   const schemaImport = module.addImport(schemaNamespace)
+  let stringFormatCodecs: ReadonlyMap<string, Fragment> = new Map()
+  if (!typeOnly && options?.stringFormatCodecs !== undefined) {
+    stringFormatCodecs = options.stringFormatCodecs(schemaImport)
+  }
+  const stringFormatBindings = new Map<string, DeclarationBinding>()
   const definitions = options?.references ?? {}
   const references = new Map(
     Object.keys(definitions).map(($ref) => [$ref, freshIdentifier($ref)])
@@ -276,7 +279,7 @@ export function addSchemas(
     representation: CheckRepresentationAnnotation | undefined,
     path: Path
   ): ReadonlyArray<Code> {
-    return representation?.schemas?.map((schema, index) => recur(schema, [...path, "schemas", index])) ?? []
+    return representation?.schemas?.map((schema, index) => recur(schema, [...path, "schemas", index], "encoded")) ?? []
   }
 
   function runtimeAnnotate(
@@ -320,9 +323,13 @@ export function addSchemas(
   function applyNode(
     base: Code,
     representation: Exclude<SchemaRepresentation.Representation, SchemaRepresentation.Reference>,
-    path: Path
+    path: Path,
+    side: SchemaSide
   ): Code {
     let runtime = code`${base.runtime}${runtimeAnnotate(representation.annotations)}`
+    const checkWire = side === "decoded" && stringFormatCodecs.size > 0 && representation.checks.length > 0 &&
+      (representation._tag === "Arrays" || representation._tag === "Objects" || representation._tag === "Union")
+    if (checkWire) runtime = code`${schemaImport}.flip(${runtime})`
     for (let index = 0; index < representation.checks.length; index++) {
       const check = representation.checks[index]
       const compiledCheck = compileCheck(check, [...path, "checks", index])
@@ -338,26 +345,56 @@ export function addSchemas(
           : `${base}.check(${check})`
       })
     }
+    if (checkWire) runtime = code`${schemaImport}.flip(${runtime})`
     return makeFragments(runtime, base.Type)
   }
 
   function recur(
     representation: SchemaRepresentation.Representation,
-    path: Path
+    path: Path,
+    side: SchemaSide = "decoded"
   ): Code {
     if (representation._tag === "Reference") {
       const identifier = references.get(representation.$ref)
       if (identifier === undefined) {
         throw errorWithPath(`Invalid reference ${representation.$ref}`, [...path, "$ref"])
       }
-      return makeFragments(dependOn(identifier), identifier)
+      const reference = dependOn(identifier)
+      if (side === "encoded" && stringFormatCodecs.size > 0) {
+        return makeFragments(code`${schemaImport}.toEncoded(${reference})`, code`typeof ${identifier}.Encoded`)
+      }
+      return makeFragments(reference, identifier)
     }
-    return applyNode(on(representation, path), representation, path)
+    const wire = applyNode(on(representation, path, side), representation, path, side)
+    if (side === "decoded" && representation._tag === "String") {
+      const format = representation.annotations?.format
+      if (typeof format === "string") {
+        const targetSchema = stringFormatCodecs.get(format)
+        if (targetSchema !== undefined) {
+          const target = dependOn(bindFormatCodec(format, targetSchema))
+          return makeFragments(
+            code`${wire.runtime}.pipe(${schemaImport}.decodeTo(${target}))`,
+            code`typeof ${target}.Type`
+          )
+        }
+      }
+    }
+    return wire
+  }
+
+  function bindFormatCodec(format: string, targetSchema: Fragment): DeclarationBinding {
+    const existing = stringFormatBindings.get(format)
+    if (existing !== undefined) return existing
+    const target = freshIdentifier(`${format}Codec`)
+    module.define(target, [code`const ${target} = ${targetSchema}`])
+    stringFormatBindings.set(format, target)
+    return target
   }
 
   function on(
     representation: Exclude<SchemaRepresentation.Representation, SchemaRepresentation.Reference>,
-    path: Path
+    path: Path,
+    side: SchemaSide
   ): Code {
     switch (representation._tag) {
       case "Declaration": {
@@ -366,7 +403,7 @@ export function addSchemas(
           throw errorWithPath("Missing toCode callback", [...path, "annotations", "toCode"])
         }
         const typeParameters = representation.typeParameters.map((typeParameter, index) =>
-          recur(typeParameter, [...path, "typeParameters", index])
+          recur(typeParameter, [...path, "typeParameters", index], side)
         )
         return compileCallback(
           typeParameters,
@@ -376,7 +413,7 @@ export function addSchemas(
       }
       case "Suspend": {
         suspendDepth++
-        const thunk = recur(representation.thunk, [...path, "thunk"])
+        const thunk = recur(representation.thunk, [...path, "thunk"], side)
         suspendDepth--
         return makeFragments(
           code`${schemaImport}.suspend((): ${schemaImport}.Codec<${thunk.Type}> => ${thunk.runtime})`,
@@ -426,7 +463,7 @@ export function addSchemas(
         return makeFragments(code`${schemaImport}.Enum(${identifier})`, identifier)
       }
       case "TemplateLiteral": {
-        const parts = representation.parts.map((part, index) => recur(part, [...path, "parts", index]))
+        const parts = representation.parts.map((part, index) => recur(part, [...path, "parts", index], "encoded"))
         const Type = code`\`${join(parts.map((part) => code`\${${part.Type}}`), "")}\``
         return makeFragments(
           code`${schemaImport}.TemplateLiteral([${join(parts.map((part) => part.runtime), ", ")}])`,
@@ -435,7 +472,7 @@ export function addSchemas(
       }
       case "Arrays": {
         const elements = representation.elements.map((element, index) => {
-          const type = recur(element.type, [...path, "elements", index, "type"])
+          const type = recur(element.type, [...path, "elements", index, "type"], side)
           return makeFragments(
             code`${element.isOptional ? code`${schemaImport}.optionalKey(` : ""}${type.runtime}${
               element.isOptional ? ")" : ""
@@ -443,7 +480,7 @@ export function addSchemas(
             element.isOptional ? code`(${type.Type})?` : type.Type
           )
         })
-        const rest = representation.rest.map((item, index) => recur(item, [...path, "rest", index]))
+        const rest = representation.rest.map((item, index) => recur(item, [...path, "rest", index], side))
         if (!Arr.isArrayNonEmpty(rest)) {
           return makeFragments(
             code`${schemaImport}.Tuple([${join(elements.map((element) => element.runtime), ", ")}])`,
@@ -470,12 +507,21 @@ export function addSchemas(
         )
       }
       case "Objects": {
+        if (
+          side === "decoded" && stringFormatCodecs.size > 0 &&
+          representation.propertySignatures.length > 0 && representation.indexSignatures.length > 0
+        ) {
+          throw errorWithPath(
+            "Cannot decode string formats in an object with named properties and index signatures",
+            path
+          )
+        }
         const properties = representation.propertySignatures.map((property, index) => {
           const isSymbol = typeof property.name === "symbol"
           const name = isSymbol
             ? code`[${addSymbol(property.name)}]`
             : formatPropertyKey(property.name)
-          const type = recur(property.type, [...path, "propertySignatures", index, "type"])
+          const type = recur(property.type, [...path, "propertySignatures", index, "type"], side)
           let runtime = type.runtime
           if (property.isMutable) runtime = code`${schemaImport}.mutableKey(${runtime})`
           if (property.isOptional) runtime = code`${schemaImport}.optionalKey(${runtime})`
@@ -485,8 +531,8 @@ export function addSchemas(
           return makeFragments(code`${runtimeName}: ${runtime}`, code`${typeName}: ${type.Type}`)
         })
         const indexSignatures = representation.indexSignatures.map((signature, index) => ({
-          parameter: recur(signature.parameter, [...path, "indexSignatures", index, "parameter"]),
-          type: recur(signature.type, [...path, "indexSignatures", index, "type"])
+          parameter: recur(signature.parameter, [...path, "indexSignatures", index, "parameter"], "encoded"),
+          type: recur(signature.type, [...path, "indexSignatures", index, "type"], side)
         }))
         const propertyRuntimes = join(properties.map((property) => property.runtime), ", ")
         const propertyTypes = join(properties.map((property) => property.Type), ", ")
@@ -529,7 +575,7 @@ export function addSchemas(
             ? makeFragments(code`${schemaImport}.Literal(${literals[0]})`, literals[0])
             : makeFragments(code`${schemaImport}.Literals([${literals.join(", ")}])`, literals.join(" | "))
         }
-        const types = representation.types.map((type, index) => recur(type, [...path, "types", index]))
+        const types = representation.types.map((type, index) => recur(type, [...path, "types", index], side))
         const options = representation.options === undefined
           ? ""
           : `, ${unionOptionsRuntime(representation.options)}`
