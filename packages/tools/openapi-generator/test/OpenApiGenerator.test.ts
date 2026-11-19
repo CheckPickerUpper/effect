@@ -87,6 +87,7 @@ const assertTypeOnlyIncludes = Effect.fnUntraced(function*(
 interface CompileOptions {
   readonly exactOptionalPropertyTypes?: boolean | undefined
   readonly formats?: ReadonlyArray<OpenApiGenerator.OpenApiGeneratorFormat> | undefined
+  readonly stringFormats?: OpenApiGenerator.OpenApiGenerateOptions["stringFormats"]
   readonly usage?: string | undefined
 }
 
@@ -103,7 +104,7 @@ const generateClients = ({ options, spec }: (typeof compileCases)[number]) => {
   ) =>
     Effect.gen(function*() {
       const generator = yield* OpenApiGenerator.OpenApiGenerator
-      return yield* generator.generate(spec, { name: "TestClient", format })
+      return yield* generator.generate(spec, { name: "TestClient", format, stringFormats: options.stringFormats })
     }).pipe(Effect.provide(layer))
 
   const formats = options.formats ?? ["httpclient", "httpclient-type-only"]
@@ -825,8 +826,103 @@ const cookieParameterSpec: OpenAPISpec = {
   tags: [{ name: "Greeting" }]
 }
 
+const deliverySpec: OpenAPISpec = {
+  openapi: "3.1.0",
+  info: { title: "Delivery API", version: "1.0.0" },
+  paths: {
+    "/delivery": {
+      get: {
+        operationId: "readDelivery",
+        parameters: [],
+        tags: ["Delivery"],
+        security: [],
+        responses: {
+          200: {
+            description: "Delivery",
+            content: { "application/json": { schema: { $ref: "#/components/schemas/Delivery" } } }
+          }
+        }
+      }
+    }
+  },
+  components: {
+    schemas: {
+      Delivery: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          changed: { type: "string", format: "date-time" },
+          prior: { anyOf: [{ $ref: "#/components/schemas/Delivery" }, { type: "null" }] },
+          notes: {
+            type: "object",
+            propertyNames: { enum: ["drone", "post"] },
+            additionalProperties: { type: "string" }
+          }
+        },
+        required: ["changed", "prior", "notes"]
+      }
+    },
+    securitySchemes: {}
+  },
+  security: [],
+  tags: [{ name: "Delivery" }]
+}
+
 describe("OpenApiGenerator", () => {
   describe("schema", () => {
+    itGeneratedClientsCompile("types recursive dates and optional literal dictionary keys", deliverySpec, {
+      formats: ["httpapi"],
+      stringFormats: "decoded",
+      usage: `
+export function reencode(delivery: Delivery): typeof Delivery.Encoded {
+  return Schema.encodeSync(Delivery)(delivery)
+}
+export const delivery: typeof Delivery.Encoded = {
+  changed: "2026-06-01T00:00:00Z",
+  prior: { changed: "2026-05-31T00:00:00Z", prior: null, notes: { drone: "morning" } },
+  notes: {}
+}
+export function note(delivery: Delivery): string | undefined {
+  return delivery.notes.drone
+}
+export function invalidNote(delivery: typeof Delivery.Type) {
+  // @ts-expect-error Only "drone" and "post" are declared courier names.
+  return delivery.notes.other
+}
+export function invalidWireNote(delivery: typeof Delivery.Encoded) {
+  // @ts-expect-error The wire dictionary has the same property names.
+  return delivery.notes.other
+}
+`
+    })
+
+    it.effect("round-trips recursive records and rejects unlisted dictionary keys", () =>
+      Effect.gen(function*() {
+        const generator = yield* OpenApiGenerator.OpenApiGenerator
+        const source = yield* generator.generate(deliverySpec, {
+          name: "DeliveryApi",
+          format: "httpapi",
+          stringFormats: "decoded"
+        })
+        const prior = { changed: "2026-05-31T00:00:00.000Z", prior: null, notes: { drone: "morning" } }
+        const wire = { changed: "2026-06-01T00:00:00.000Z", prior, notes: {} }
+        yield* Effect.tryPromise({
+          try: () =>
+            withGeneratedModule<{ Delivery: Schema.Codec<unknown> }>(source, ({ Delivery }) => {
+              const decode = Schema.decodeUnknownExit(Delivery)
+              const decoded = Schema.decodeUnknownSync(Delivery)(wire)
+              assert.deepStrictEqual(decoded, {
+                changed: DateTime.makeUnsafe(wire.changed),
+                prior: { ...prior, changed: DateTime.makeUnsafe(prior.changed) },
+                notes: {}
+              })
+              assert.deepStrictEqual(Schema.encodeUnknownExit(Delivery)(decoded), Exit.succeed(wire))
+              assert.isTrue(Exit.isFailure(decode({ ...wire, prior: { ...prior, notes: { other: "morning" } } })))
+            }),
+          catch: (cause) => cause
+        })
+      }).pipe(Effect.provide(OpenApiGenerator.layerTransformerSchema)))
+
     it.effect("decodes formatted strings while preserving the wire constraints", () =>
       Effect.gen(function*() {
         const spec: OpenAPISpec = {

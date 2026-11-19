@@ -107,6 +107,30 @@ function isSimpleLiveLiteral(
     representation.annotations === undefined
 }
 
+function literalPropertyNames(checks: ReadonlyArray<SchemaRepresentation.Check>): ReadonlyArray<string> | undefined {
+  for (const check of checks) {
+    if (check._tag === "FilterGroup") {
+      const names = literalPropertyNames(check.checks)
+      if (names !== undefined) return names
+      continue
+    }
+    const representation = check.representation
+    if (representation?.id !== "effect/schema/isPropertyNames") continue
+    const keys = representation.schemas?.[0]
+    if (keys === undefined) continue
+    const members = keys._tag === "Union" ? keys.types : [keys]
+    if (
+      members.length > 0 && members.every(
+        (key): key is SchemaRepresentation.Literal & { readonly literal: string } =>
+          key._tag === "Literal" && typeof key.literal === "string"
+      )
+    ) {
+      return members.map((key) => key.literal)
+    }
+  }
+  return undefined
+}
+
 interface SymbolDeclaration {
   readonly binding: DeclarationBinding
   runtime: boolean
@@ -140,15 +164,20 @@ export function addSchemas(
   const references = new Map(
     Object.keys(definitions).map(($ref) => [$ref, freshIdentifier($ref)])
   )
+  const encodedReferences = new Map<string, DeclarationBinding>()
+  const encodedTypeFragments = new Map<Fragment, () => Fragment>()
   const symbols = moduleSymbols.get(module) ?? new Map<symbol, SymbolDeclaration>()
   moduleSymbols.set(module, symbols)
   const parsedImports = new Map<string, CodeImports.Imports>()
   let callbackIndex = 0
   let dependencies = new Set<Binding>()
   let suspendDepth = 0
-  for (const [$ref, binding] of references) {
-    defineSchema(binding, definitions[$ref], ["references", $ref])
-  }
+  const referenceTypes = Object.fromEntries(
+    Array.from(
+      references,
+      ([$ref, binding]) => [$ref, defineSchema(binding, definitions[$ref], ["references", $ref])] as const
+    )
+  )
   const bindings = new Map<string, DeclarationBinding>()
   for (const [index, [name, representation]] of Object.entries(schemas).entries()) {
     const existing = representation._tag === "Reference" && representation.$ref === name
@@ -162,19 +191,46 @@ export function addSchemas(
       bindings.set(name, binding)
     }
   }
+  // Resolving an encoded alias can request more aliases for its referenced types.
+  for (const [$ref, binding] of encodedReferences) {
+    module.define(binding, [code`type ${binding} = ${encodedType(referenceTypes[$ref])}`])
+  }
   return bindings
 
   function defineSchema(
     binding: DeclarationBinding,
     representation: SchemaRepresentation.Representation,
     path: Path
-  ): void {
+  ): Fragment {
     dependencies = new Set()
     const fragments = recur(representation, path)
     module.define(binding, [
       code`export type ${binding} = ${fragments.Type}`,
       ...(typeOnly ? [] : [code`export const ${binding} = ${fragments.runtime}`])
     ], [...dependencies])
+    return fragments.Type
+  }
+
+  function withEncodedType(decoded: Fragment, encoded: () => Fragment): Fragment {
+    const fragment = code`${decoded}`
+    encodedTypeFragments.set(fragment, encoded)
+    return fragment
+  }
+
+  function encodedType(fragment: Fragment): Fragment {
+    const replacement = encodedTypeFragments.get(fragment)
+    if (replacement !== undefined) return replacement()
+    return typeof fragment !== "string" && fragment._tag === "Parts"
+      ? join(fragment.parts.map(encodedType), "")
+      : fragment
+  }
+
+  function encodedReference($ref: string): DeclarationBinding {
+    const existing = encodedReferences.get($ref)
+    if (existing !== undefined) return existing
+    const binding = freshIdentifier(`${$ref}Encoded`)
+    encodedReferences.set($ref, binding)
+    return binding
   }
 
   function dependOn(binding: DeclarationBinding): DeclarationBinding {
@@ -360,13 +416,18 @@ export function addSchemas(
         throw errorWithPath(`Invalid reference ${representation.$ref}`, [...path, "$ref"])
       }
       const reference = dependOn(identifier)
-      if (side === "encoded" && stringFormatCodecs.size > 0) {
-        return makeFragments(code`${schemaImport}.toEncoded(${reference})`, code`typeof ${identifier}.Encoded`)
-      }
-      return makeFragments(reference, identifier)
+      if (stringFormatCodecs.size === 0) return makeFragments(reference, identifier)
+      return side === "encoded"
+        ? makeFragments(
+          code`${schemaImport}.toEncoded(${reference})`,
+          withEncodedType(code`typeof ${identifier}.Encoded`, () => encodedReference(representation.$ref))
+        )
+        : makeFragments(reference, withEncodedType(identifier, () => encodedReference(representation.$ref)))
     }
     const wire = applyNode(on(representation, path, side), representation, path, side)
-    if (side === "decoded" && representation._tag === "String") {
+    if (side !== "decoded" || stringFormatCodecs.size === 0) return wire
+    if (representation._tag === "Objects") return narrowRecordKeys(representation, wire)
+    if (representation._tag === "String") {
       const format = representation.annotations?.format
       if (typeof format === "string") {
         const targetSchema = stringFormatCodecs.get(format)
@@ -374,12 +435,32 @@ export function addSchemas(
           const target = dependOn(bindFormatCodec(format, targetSchema))
           return makeFragments(
             code`${wire.runtime}.pipe(${schemaImport}.decodeTo(${target}))`,
-            code`typeof ${target}.Type`
+            withEncodedType(code`typeof ${target}.Type`, () => wire.Type)
           )
         }
       }
     }
     return wire
+  }
+
+  function narrowRecordKeys(representation: SchemaRepresentation.Objects, record: Code): Code {
+    if (
+      representation.propertySignatures.length !== 0 ||
+      representation.indexSignatures.length !== 1 ||
+      representation.indexSignatures[0].parameter._tag !== "String"
+    ) return record
+    const names = literalPropertyNames(representation.checks)
+    if (names === undefined) return record
+    const keys = names.map((name) => format(name)).join(" | ")
+    const Type = code`{ readonly [key in ${keys}]?: (${record.Type})[string] }`
+    const schema = module.declare("record", { scope: module.scope() })
+    // The checked AST already rejects other keys. A finite Record would discard them before the check.
+    return makeFragments(
+      code`${record.runtime}.pipe((${schema}) => ${schemaImport}.make<${schemaImport}.Codec<${Type}, ${
+        encodedType(Type)
+      }, typeof ${schema}.DecodingServices, typeof ${schema}.EncodingServices>>(${schema}.ast))`,
+      Type
+    )
   }
 
   function bindFormatCodec(format: string, targetSchema: Fragment): DeclarationBinding {
@@ -415,8 +496,11 @@ export function addSchemas(
         suspendDepth++
         const thunk = recur(representation.thunk, [...path, "thunk"], side)
         suspendDepth--
+        const codecTypes = side === "decoded" && stringFormatCodecs.size > 0
+          ? code`${thunk.Type}, ${encodedType(thunk.Type)}`
+          : thunk.Type
         return makeFragments(
-          code`${schemaImport}.suspend((): ${schemaImport}.Codec<${thunk.Type}> => ${thunk.runtime})`,
+          code`${schemaImport}.suspend((): ${schemaImport}.Codec<${codecTypes}> => ${thunk.runtime})`,
           thunk.Type
         )
       }
